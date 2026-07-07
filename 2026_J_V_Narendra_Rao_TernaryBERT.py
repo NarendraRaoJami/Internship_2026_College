@@ -11,6 +11,8 @@ from scipy.stats import pearsonr
 from sklearn.metrics import precision_score, recall_score, f1_score, matthews_corrcoef
 from datasets import load_dataset
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
 REPO_DIR = os.path.expanduser("~/Pretrained-Language-Model")
 if not os.path.exists(REPO_DIR):
     print("Cloning TernaryBERT repo...")
@@ -25,7 +27,8 @@ print("Working dir:", os.getcwd())
 from transformer import (BertForSequenceClassification, BertConfig, BertTokenizer,
                          BertAdam, WEIGHTS_NAME, CONFIG_NAME)
 from transformer.modeling_quant import BertForSequenceClassification as QuantBertForSequenceClassification
-from transformers import (BertTokenizer as HFBertTokenizer,
+from transformers import (AutoTokenizer, AutoModelForSequenceClassification,
+                          BertTokenizer as HFBertTokenizer,
                           BertForSequenceClassification as HFBertForSequenceClassification)
 from utils_glue import (
     InputExample, convert_examples_to_features,
@@ -33,44 +36,64 @@ from utils_glue import (
     StsbProcessor, QqpProcessor, QnliProcessor, RteProcessor, WnliProcessor,
 )
 
+import modeling_quant_extra as quant_extra
+
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print("Device:", DEVICE)
 if torch.cuda.is_available():
     print("GPU:", torch.cuda.get_device_name(0))
 
-MODEL_DIR  = os.path.expanduser("~/ternarybert_models")   
-OUTPUT_DIR = os.path.expanduser("~/ternarybert_output")   
+MODEL_DIR  = os.path.expanduser("~/ternarybert_models")
+OUTPUT_DIR = os.path.expanduser("~/ternarybert_output")
 RESULTS_PATH = os.path.expanduser("~/ternarybert_results.csv")
 os.makedirs(MODEL_DIR,  exist_ok=True)
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
+SEED = 42
+
+def set_seed(seed=SEED):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
 TASKS = {
     "sst2": dict(repo_name="sst-2", glue_cfg="sst2", processor=Sst2Processor(), output_mode="classification",
-                 max_seq_length=64,  batch_size=32, eval_step=200,  fields=("sentence",  None),         label_mode="raw01"),
+                 max_seq_length=128, batch_size=16, eval_step=200,  fields=("sentence",  None),         label_mode="raw01"),
     "qnli": dict(repo_name="qnli",  glue_cfg="qnli", processor=QnliProcessor(), output_mode="classification",
-                 max_seq_length=128, batch_size=32, eval_step=1000, fields=("question",  "sentence"),    label_mode="class_names"),
+                 max_seq_length=128, batch_size=16, eval_step=1000, fields=("question",  "sentence"),    label_mode="class_names"),
     "qqp":  dict(repo_name="qqp",   glue_cfg="qqp",  processor=QqpProcessor(),  output_mode="classification",
-                 max_seq_length=128, batch_size=32, eval_step=1000, fields=("question1", "question2"),   label_mode="raw01"),
+                 max_seq_length=128, batch_size=16, eval_step=1000, fields=("question1", "question2"),   label_mode="raw01"),
     "wnli": dict(repo_name="wnli",  glue_cfg="wnli", processor=WnliProcessor(), output_mode="classification",
-                 max_seq_length=128, batch_size=32, eval_step=50,   fields=("sentence1", "sentence2"),   label_mode="raw01"),
+                 max_seq_length=128, batch_size=16, eval_step=50,   fields=("sentence1", "sentence2"),   label_mode="raw01"),
     "mnli": dict(repo_name="mnli",  glue_cfg="mnli", processor=MnliProcessor(), output_mode="classification",
-                 max_seq_length=128, batch_size=32, eval_step=1000, fields=("premise",   "hypothesis"),  label_mode="class_names"),
+                 max_seq_length=128, batch_size=16, eval_step=1000, fields=("premise",   "hypothesis"),  label_mode="class_names"),
     "mrpc": dict(repo_name="mrpc",  glue_cfg="mrpc", processor=MrpcProcessor(), output_mode="classification",
-                 max_seq_length=128, batch_size=32, eval_step=200,  fields=("sentence1", "sentence2"),   label_mode="raw01"),
+                 max_seq_length=128, batch_size=16, eval_step=200,  fields=("sentence1", "sentence2"),   label_mode="raw01"),
     "stsb": dict(repo_name="sts-b", glue_cfg="stsb", processor=StsbProcessor(), output_mode="regression",
-                 max_seq_length=128, batch_size=32, eval_step=50,   fields=("sentence1", "sentence2"),   label_mode="regression"),
+                 max_seq_length=128, batch_size=16, eval_step=50,   fields=("sentence1", "sentence2"),   label_mode="regression"),
     "rte":  dict(repo_name="rte",   glue_cfg="rte",  processor=RteProcessor(),  output_mode="classification",
-                 max_seq_length=128, batch_size=32, eval_step=100,  fields=("sentence1", "sentence2"),   label_mode="class_names"),
+                 max_seq_length=128, batch_size=16, eval_step=100,  fields=("sentence1", "sentence2"),   label_mode="class_names"),
     "cola": dict(repo_name="cola",  glue_cfg="cola", processor=ColaProcessor(), output_mode="classification",
-                 max_seq_length=64,  batch_size=16, eval_step=50,   fields=("sentence",  None),          label_mode="raw01"),
+                 max_seq_length=128, batch_size=16, eval_step=50,   fields=("sentence",  None),          label_mode="raw01"),
 }
 
+
 TASK_EPOCHS = {
-    "sst2": 3, "qnli": 3, "qqp": 3, "mnli": 3,
+    "sst2": 5, "qnli": 5, "qqp": 5, "mnli": 5,
     "wnli": 5, "rte":  5, "mrpc": 5, "stsb": 5, "cola": 5,
 }
 
 TASK_ORDER = ["wnli", "rte", "mrpc", "stsb", "cola", "sst2", "qnli", "qqp", "mnli"]
+
+MODEL_REGISTRY = {
+    "bert-base":    dict(display_name="BERT-base",    hf_checkpoint="bert-base-uncased",                 supports_quant=True),
+    "electra-base": dict(display_name="ELECTRA-Base", hf_checkpoint="google/electra-base-discriminator", supports_quant=True),
+    "roberta-base": dict(display_name="RoBERTa-Base", hf_checkpoint="roberta-base",                      supports_quant=True),
+}
+
+MODEL_ORDER = ["bert-base", "electra-base", "roberta-base"]
 
 def load_glue_examples(task_key, split, max_examples=None):
     cfg = TASKS[task_key]
@@ -126,20 +149,25 @@ class _HFGlueDataset(Dataset):
             item["labels"] = torch.tensor(float(ex.label), dtype=torch.float)
         return item
 
-def fine_tune_teacher(task_key, epochs=3, lr=2e-5, max_train_examples=None):
+def fine_tune_teacher(task_key, model_key="bert-base", epochs=5, lr=2e-5, max_train_examples=None):
     cfg = TASKS[task_key]
+    model_info = MODEL_REGISTRY[model_key]
+    hf_checkpoint = model_info["hf_checkpoint"]
+
     label_list = cfg["processor"].get_labels()
     num_labels = 1 if cfg["output_mode"] == "regression" else len(label_list)
     label_map  = {l: i for i, l in enumerate(label_list)} if cfg["output_mode"] == "classification" else None
 
-    hf_tok = HFBertTokenizer.from_pretrained("bert-base-uncased")
+    set_seed(SEED)
+
+    hf_tok = AutoTokenizer.from_pretrained(hf_checkpoint)
     train_examples = load_glue_examples(task_key, "train", max_examples=max_train_examples)
     train_ds = _HFGlueDataset(train_examples, label_map, cfg["max_seq_length"], hf_tok, cfg["output_mode"])
     train_loader = DataLoader(train_ds, batch_size=cfg["batch_size"], shuffle=True)
 
     problem_type = "regression" if cfg["output_mode"] == "regression" else "single_label_classification"
-    model = HFBertForSequenceClassification.from_pretrained(
-        "bert-base-uncased", num_labels=num_labels, problem_type=problem_type).to(DEVICE)
+    model = AutoModelForSequenceClassification.from_pretrained(
+        hf_checkpoint, num_labels=num_labels, problem_type=problem_type).to(DEVICE)
 
     no_decay = ["bias", "LayerNorm.bias", "LayerNorm.weight"]
     optimizer_grouped_parameters = [
@@ -171,14 +199,14 @@ def fine_tune_teacher(task_key, epochs=3, lr=2e-5, max_train_examples=None):
             scheduler.step()
             global_step += 1
             if step % 200 == 0:
-                print(f"  [{task_key}] teacher epoch {ep+1}/{epochs}  step {step}/{len(train_loader)}  loss {out.loss.item():.4f}")
+                print(f"  [{task_key}/{model_key}] teacher epoch {ep+1}/{epochs}  step {step}/{len(train_loader)}  loss {out.loss.item():.4f}")
 
-    save_dir = os.path.join(MODEL_DIR, cfg["repo_name"])
+    save_dir = os.path.join(MODEL_DIR, model_key, cfg["repo_name"])
     os.makedirs(save_dir, exist_ok=True)
     torch.save(model.state_dict(), os.path.join(save_dir, "pytorch_model.bin"))
     model.config.to_json_file(os.path.join(save_dir, "config.json"))
-    hf_tok.save_vocabulary(save_dir)
-    print(f"  [{task_key}] teacher saved to {save_dir}")
+    hf_tok.save_pretrained(save_dir)
+    print(f"  [{task_key}/{model_key}] teacher saved to {save_dir}")
     return save_dir
 
 def predict_all(model, eval_dataloader, output_mode):
@@ -223,41 +251,92 @@ def soft_cross_entropy(predicts, targets):
     return (-torch.nn.functional.softmax(targets, dim=-1) *
              torch.nn.functional.log_softmax(predicts, dim=-1)).mean()
 
-def run_quant_glue(task_key, epochs=3, lr=2e-5, weight_bits=2, input_bits=8, clip_val=2.5,
+def _hf_tokenized_dataloader(examples, tokenizer, max_seq_length, output_mode, label_list, batch_size, sampler_cls):
+    label_map = {l: i for i, l in enumerate(label_list)} if output_mode == "classification" else None
+    input_ids_list, mask_list, segment_list, labels_out = [], [], [], []
+    for ex in examples:
+        enc = tokenizer(ex.text_a, ex.text_b, truncation=True, padding="max_length", max_length=max_seq_length)
+        input_ids_list.append(enc["input_ids"])
+        mask_list.append(enc["attention_mask"])
+        segment_list.append(enc.get("token_type_ids", [0] * max_seq_length))
+        if ex.label is None:
+            labels_out.append(0)
+        elif output_mode == "classification":
+            labels_out.append(label_map[ex.label])
+        else:
+            labels_out.append(float(ex.label))
+
+    input_ids   = torch.tensor(input_ids_list, dtype=torch.long)
+    input_mask  = torch.tensor(mask_list, dtype=torch.long)
+    segment_ids = torch.tensor(segment_list, dtype=torch.long)
+    label_ids   = torch.tensor(labels_out, dtype=torch.float if output_mode == "regression" else torch.long)
+    seq_lengths = input_mask.sum(dim=1)
+
+    dataset = torch.utils.data.TensorDataset(input_ids, input_mask, segment_ids, label_ids, seq_lengths)
+    return DataLoader(dataset, sampler=sampler_cls(dataset), batch_size=batch_size)
+
+
+def run_quant_glue(task_key, model_key="bert-base", epochs=5, lr=2e-5, weight_bits=2, input_bits=8, clip_val=2.5,
                    max_train_examples=None, max_eval_examples=None):
+    set_seed(SEED)
+
     cfg = TASKS[task_key]
     repo_task, output_mode = cfg["repo_name"], cfg["output_mode"]
     label_list = cfg["processor"].get_labels()
     num_labels = 1 if output_mode == "regression" else len(label_list)
     max_seq_length, batch_size, eval_step = cfg["max_seq_length"], cfg["batch_size"], cfg["eval_step"]
 
-    task_model_dir = os.path.join(MODEL_DIR, repo_task)
-    tokenizer = BertTokenizer.from_pretrained(task_model_dir, do_lower_case=True)
-
+    task_model_dir = os.path.join(MODEL_DIR, model_key, repo_task)
     train_examples = load_glue_examples(task_key, "train", max_examples=max_train_examples)
-    train_features = convert_examples_to_features(train_examples, label_list, max_seq_length, tokenizer, output_mode)
-    train_data, _  = get_tensor_data(output_mode, train_features)
-    train_dataloader = DataLoader(train_data, sampler=RandomSampler(train_data), batch_size=batch_size)
+    dev_examples   = load_glue_examples(task_key, "validation", max_examples=max_eval_examples)
 
-    dev_examples = load_glue_examples(task_key, "validation", max_examples=max_eval_examples)
-    dev_features = convert_examples_to_features(dev_examples, label_list, max_seq_length, tokenizer, output_mode)
-    eval_data, _ = get_tensor_data(output_mode, dev_features)
-    eval_dataloader = DataLoader(eval_data, sampler=SequentialSampler(eval_data), batch_size=batch_size)
+    if model_key == "bert-base":
+        tokenizer = BertTokenizer.from_pretrained(task_model_dir, do_lower_case=True)
 
-    teacher_model = BertForSequenceClassification.from_pretrained(task_model_dir, num_labels=num_labels).to(DEVICE)
-    teacher_model.eval()
+        train_features = convert_examples_to_features(train_examples, label_list, max_seq_length, tokenizer, output_mode)
+        train_data, _  = get_tensor_data(output_mode, train_features)
+        train_dataloader = DataLoader(train_data, sampler=RandomSampler(train_data), batch_size=batch_size)
 
-    student_config = BertConfig.from_pretrained(task_model_dir, quantize_act=True,
-                                                weight_bits=weight_bits, input_bits=input_bits, clip_val=clip_val)
-    student_model  = QuantBertForSequenceClassification.from_pretrained(
-        task_model_dir, config=student_config, num_labels=num_labels).to(DEVICE)
+        dev_features = convert_examples_to_features(dev_examples, label_list, max_seq_length, tokenizer, output_mode)
+        eval_data, _ = get_tensor_data(output_mode, dev_features)
+        eval_dataloader = DataLoader(eval_data, sampler=SequentialSampler(eval_data), batch_size=batch_size)
+
+        teacher_model = BertForSequenceClassification.from_pretrained(task_model_dir, num_labels=num_labels).to(DEVICE)
+        teacher_model.eval()
+
+        student_config = BertConfig.from_pretrained(task_model_dir, quantize_act=True,
+                                                    weight_bits=weight_bits, input_bits=input_bits, clip_val=clip_val)
+        student_model  = QuantBertForSequenceClassification.from_pretrained(
+            task_model_dir, config=student_config, num_labels=num_labels).to(DEVICE)
+
+        num_train_examples_for_steps = len(train_features)
+
+    else:
+        backend = quant_extra.QUANT_BACKENDS[model_key]
+        tokenizer = AutoTokenizer.from_pretrained(task_model_dir)
+
+        train_dataloader = _hf_tokenized_dataloader(train_examples, tokenizer, max_seq_length, output_mode,
+                                                     label_list, batch_size, RandomSampler)
+        eval_dataloader  = _hf_tokenized_dataloader(dev_examples, tokenizer, max_seq_length, output_mode,
+                                                     label_list, batch_size, SequentialSampler)
+
+        teacher_model = backend["teacher_cls"].from_pretrained(
+            task_model_dir, BertConfig.from_pretrained(task_model_dir), num_labels=num_labels).to(DEVICE)
+        teacher_model.eval()
+
+        student_config = BertConfig.from_pretrained(task_model_dir, quantize_act=True,
+                                                    weight_bits=weight_bits, input_bits=input_bits, clip_val=clip_val)
+        student_model = backend["student_cls"].from_pretrained(
+            task_model_dir, student_config, num_labels=num_labels).to(DEVICE)
+
+        num_train_examples_for_steps = len(train_examples)
 
     no_decay = ["bias", "LayerNorm.bias", "LayerNorm.weight"]
     optimizer_grouped_parameters = [
         {"params": [p for n, p in student_model.named_parameters() if not any(nd in n for nd in no_decay)], "weight_decay": 0.01},
         {"params": [p for n, p in student_model.named_parameters() if     any(nd in n for nd in no_decay)], "weight_decay": 0.0},
     ]
-    num_train_steps = max(1, int(len(train_features) / batch_size) * epochs)
+    num_train_steps = max(1, int(num_train_examples_for_steps / batch_size) * epochs)
     optimizer = BertAdam(optimizer_grouped_parameters, schedule="warmup_linear",
                          lr=lr, warmup=0.1, t_total=num_train_steps)
     loss_mse = MSELoss()
@@ -295,7 +374,7 @@ def run_quant_glue(task_key, epochs=3, lr=2e-5, weight_bits=2, input_bits=8, cli
             if global_step % eval_step == 0:
                 m  = full_eval_metrics(student_model, output_mode, num_labels, eval_dataloader)
                 pm = primary_metric(repo_task, m)
-                print(f"  [{task_key}] step {global_step}/{num_train_steps}  primary_metric={pm:.4f}")
+                print(f"  [{task_key}/{model_key}] step {global_step}/{num_train_steps}  primary_metric={pm:.4f}")
                 if pm > best_metric:
                     best_metric, best_state = pm, copy.deepcopy(student_model.state_dict())
                 student_model.train()
@@ -312,11 +391,14 @@ def run_quant_glue(task_key, epochs=3, lr=2e-5, weight_bits=2, input_bits=8, cli
             module.weight.data = module.weight_quantizer.apply(
                 module.weight, module.weight_clip_val, module.weight_bits, True)
 
-    task_output_dir = os.path.join(OUTPUT_DIR, repo_task, "quant")
+    task_output_dir = os.path.join(OUTPUT_DIR, model_key, repo_task, "quant")
     os.makedirs(task_output_dir, exist_ok=True)
     torch.save(quant_model.state_dict(), os.path.join(task_output_dir, WEIGHTS_NAME))
     quant_model.config.to_json_file(os.path.join(task_output_dir, CONFIG_NAME))
-    tokenizer.save_vocabulary(task_output_dir)
+    if model_key == "bert-base":
+        tokenizer.save_vocabulary(task_output_dir)
+    else:
+        tokenizer.save_pretrained(task_output_dir)
 
     final_metrics = full_eval_metrics(quant_model, output_mode, num_labels, eval_dataloader)
     return quant_model, tokenizer, final_metrics, task_output_dir
@@ -335,15 +417,21 @@ def model_disk_size_mb(path_dir):
     return os.path.getsize(os.path.join(path_dir, WEIGHTS_NAME)) / 1e6
 
 
-def benchmark_model(model, tokenizer, max_seq_length, n_warmup=10, n_runs=50):
+def benchmark_model(model, tokenizer, max_seq_length, n_warmup=10, n_runs=50, model_key="bert-base"):
     model.eval()
-    dummy = [InputExample(guid="bench-0",
-                          text_a="this is a short sentence used purely for latency benchmarking",
-                          text_b=None, label=None)]
-    feats = convert_examples_to_features(dummy, ["0", "1"], max_seq_length, tokenizer, "classification")
-    input_ids   = torch.tensor([feats[0].input_ids],   dtype=torch.long, device=DEVICE)
-    input_mask  = torch.tensor([feats[0].input_mask],  dtype=torch.long, device=DEVICE)
-    segment_ids = torch.tensor([feats[0].segment_ids], dtype=torch.long, device=DEVICE)
+    dummy_text = "this is a short sentence used purely for latency benchmarking"
+
+    if model_key == "bert-base":
+        dummy = [InputExample(guid="bench-0", text_a=dummy_text, text_b=None, label=None)]
+        feats = convert_examples_to_features(dummy, ["0", "1"], max_seq_length, tokenizer, "classification")
+        input_ids   = torch.tensor([feats[0].input_ids],   dtype=torch.long, device=DEVICE)
+        input_mask  = torch.tensor([feats[0].input_mask],  dtype=torch.long, device=DEVICE)
+        segment_ids = torch.tensor([feats[0].segment_ids], dtype=torch.long, device=DEVICE)
+    else:
+        enc = tokenizer(dummy_text, truncation=True, padding="max_length", max_length=max_seq_length)
+        input_ids   = torch.tensor([enc["input_ids"]], dtype=torch.long, device=DEVICE)
+        input_mask  = torch.tensor([enc["attention_mask"]], dtype=torch.long, device=DEVICE)
+        segment_ids = torch.tensor([enc.get("token_type_ids", [0] * max_seq_length)], dtype=torch.long, device=DEVICE)
 
     with torch.no_grad():
         for _ in range(n_warmup):
@@ -366,25 +454,33 @@ def benchmark_model(model, tokenizer, max_seq_length, n_warmup=10, n_runs=50):
 
 RESULTS_PATH = os.path.expanduser("~/ternarybert_results.csv")
 
-COLUMNS = ["task_key", "Model name", "Memory Size", "Latency", "Accuracy",
+COLUMNS = ["task_key", "model_key", "Model name", "Memory Size", "Latency", "Accuracy",
            "Bits", "Precision", "Recall", "F1-score", "Throughput", "Energy Consumption"]
 
 def load_checkpoint():
-    """Returns dict of {task_key: row_dict} from CSV, or empty dict if no file."""
+    """Returns dict of {(task_key, model_key): row_dict} from CSV, or empty dict if no file."""
     if not os.path.exists(RESULTS_PATH):
         return {}
     df = pd.read_csv(RESULTS_PATH)
-    return {row["task_key"]: row.drop("task_key").to_dict() for _, row in df.iterrows()}
+    result = {}
+    for _, row in df.iterrows():
+        key = (row["task_key"], row.get("model_key", "bert-base"))
+        result[key] = row.drop(["task_key", "model_key"], errors="ignore").to_dict()
+    return result
 
 def save_checkpoint(results):
-    rows = [{"task_key": k, **v} for k, v in results.items()]
+    rows = [{"task_key": tk, "model_key": mk, **v} for (tk, mk), v in results.items()]
     pd.DataFrame(rows, columns=COLUMNS).to_csv(RESULTS_PATH, index=False)
-    print(f"  Checkpoint saved → {RESULTS_PATH}")
+    print(f"  Checkpoint saved -> {RESULTS_PATH}")
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--tasks",  nargs="+", choices=list(TASKS), default=TASK_ORDER,
                         help="Tasks to run (default: all in paper order)")
+    parser.add_argument("--models", nargs="+", choices=list(MODEL_REGISTRY), default=list(MODEL_REGISTRY),
+                        help="Model backbones to benchmark (default: all of bert-base, "
+                             "electra-base, roberta-base). Each gets the full pipeline: "
+                             "fp32 teacher fine-tune -> W2A8 quant-aware distillation -> benchmark.")
     parser.add_argument("--quick",  action="store_true",
                         help="Quick test: 200 train / 100 eval examples (NOT paper-comparable)")
     args = parser.parse_args()
@@ -392,64 +488,75 @@ def main():
     if args.quick:
         print("WARNING: --quick mode active. Results will NOT match the paper.")
 
+    set_seed(SEED)
     results = load_checkpoint()
 
-    for task_key in args.tasks:
-        if task_key in results:
-            print(f"Skipping {task_key} (already in checkpoint)")
-            continue
+    for model_key in args.models:
+        for task_key in args.tasks:
+            key = (task_key, model_key)
+            if key in results:
+                print(f"Skipping {task_key}/{model_key} (already in checkpoint)")
+                continue
 
-        cfg      = TASKS[task_key]
-        n_epochs = TASK_EPOCHS[task_key]
-        max_train = 200 if args.quick else None
-        max_eval  = 100 if args.quick else None
+            cfg      = TASKS[task_key]
+            n_epochs = TASK_EPOCHS[task_key]
+            max_train = 200 if args.quick else None
+            max_eval  = 100 if args.quick else None
 
-        try:
-            print(f"\n{'='*60}")
-            print(f"  {task_key.upper()} | stage 1: fine-tuning fp32 teacher (epochs={n_epochs})")
-            print(f"{'='*60}")
-            fine_tune_teacher(task_key, epochs=n_epochs, lr=2e-5, max_train_examples=max_train)
+            try:
+                print(f"\n{'='*60}")
+                print(f"  {task_key.upper()} / {model_key} | stage 1: fine-tuning fp32 teacher (epochs={n_epochs})")
+                print(f"{'='*60}")
+                fine_tune_teacher(task_key, model_key=model_key, epochs=n_epochs, lr=2e-5, max_train_examples=max_train)
 
-            print(f"\n{'='*60}")
-            print(f"  {task_key.upper()} | stage 2: W2A8 quantization-aware distillation (epochs={n_epochs})")
-            print(f"{'='*60}")
-            quant_model, tokenizer, metrics, out_dir = run_quant_glue(
-                task_key, epochs=n_epochs, lr=2e-5, weight_bits=2, input_bits=8,
-                max_train_examples=max_train, max_eval_examples=max_eval)
+                print(f"\n{'='*60}")
+                print(f"  {task_key.upper()} / {model_key} | stage 2: W2A8 quantization-aware distillation (epochs={n_epochs})")
+                print(f"{'='*60}")
+                quant_model, tokenizer, metrics, out_dir = run_quant_glue(
+                    task_key, model_key=model_key, epochs=n_epochs, lr=2e-5, weight_bits=2, input_bits=8,
+                    max_train_examples=max_train, max_eval_examples=max_eval)
 
-            print(f"\n  {task_key.upper()} | stage 3: benchmarking")
-            latency_ms, throughput, energy_mj = benchmark_model(quant_model, tokenizer, cfg["max_seq_length"])
-            mem_mb = model_disk_size_mb(out_dir)
+                print(f"\n  {task_key.upper()} / {model_key} | stage 3: benchmarking")
+                latency_ms, throughput, energy_mj = benchmark_model(quant_model, tokenizer, cfg["max_seq_length"], model_key=model_key)
+                mem_mb = model_disk_size_mb(out_dir)
 
-            def pct(v):
-                return None if v is None or (isinstance(v, float) and v != v) else round(v * 100, 2)
+                def pct(v):
+                    return None if v is None or (isinstance(v, float) and v != v) else round(v * 100, 2)
 
-            results[task_key] = {
-                "Model name":         "BERT-base",
-                "Memory Size":        round(mem_mb, 2),
-                "Latency":            round(latency_ms, 3),
-                "Accuracy":           pct(metrics["accuracy"]),
-                "Bits":               2,
-                "Precision":          pct(metrics["precision"]),
-                "Recall":             pct(metrics["recall"]),
-                "F1-score":           pct(metrics["f1"]),
-                "Throughput":         round(throughput, 2),
-                "Energy Consumption": round(energy_mj, 3) if energy_mj is not None else None,
-            }
-            save_checkpoint(results)
-            print(f"\n  {task_key.upper()} DONE: {results[task_key]}\n")
+                results[key] = {
+                    "Model name":         MODEL_REGISTRY[model_key]["display_name"],
+                    "Memory Size":        round(mem_mb, 2),
+                    "Latency":            round(latency_ms, 3),
+                    "Accuracy":           pct(metrics["accuracy"]),
+                    "Bits":               2,
+                    "Precision":          pct(metrics["precision"]),
+                    "Recall":             pct(metrics["recall"]),
+                    "F1-score":           pct(metrics["f1"]),
+                    "Throughput":         round(throughput, 2),
+                    "Energy Consumption": round(energy_mj, 3) if energy_mj is not None else None,
+                }
+                save_checkpoint(results)
+                print(f"\n  {task_key.upper()}/{model_key} DONE: {results[key]}\n")
 
-        except Exception as e:
-            print(f"\n!!! {task_key} FAILED: {e}")
-            import traceback; traceback.print_exc()
-            continue
+            except NotImplementedError as e:
+                print(f"\n!!! {task_key}/{model_key} SKIPPED (not implemented): {e}")
+                continue
+            except Exception as e:
+                print(f"\n!!! {task_key}/{model_key} FAILED: {e}")
+                import traceback; traceback.print_exc()
+                continue
 
     # ── Final results table ────────────────────────────────────────────────────
     DATASET_ORDER = ["sst2", "qnli", "qqp", "wnli", "mnli", "mrpc", "stsb", "rte", "cola"]
     SHEET_NAME    = {"sst2": "SST2", "qnli": "QNLI", "qqp": "QQP", "wnli": "WNLI", "mnli": "MNLI",
                      "mrpc": "MRPC", "stsb": "STS-B", "rte": "RTE", "cola": "COLA"}
 
-    rows = [{"Dataset": SHEET_NAME[tk], **results[tk]} for tk in DATASET_ORDER if tk in results]
+    rows = []
+    for model_key in args.models:
+        for tk in DATASET_ORDER:
+            key = (tk, model_key)
+            if key in results:
+                rows.append({"Dataset": SHEET_NAME[tk], **results[key]})
     if rows:
         df = pd.DataFrame(rows)
         print("\n" + "="*60)
